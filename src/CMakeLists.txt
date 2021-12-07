@@ -36,6 +36,10 @@ endif()
 # Link threads.
 target_link_libraries(benchmark PRIVATE Threads::Threads)
 
+if (APPLE)
+  target_link_libraries(benchmark PRIVATE "-framework IOKit" "-framework CoreFoundation")
+endif()
+
 target_link_libraries(benchmark PRIVATE ${BENCHMARK_CXX_LIBRARIES})
 
 if(HAVE_LIB_RT)

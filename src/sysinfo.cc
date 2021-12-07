@@ -42,6 +42,10 @@
 #if defined(BENCHMARK_OS_QNX)
 #include <sys/syspage.h>
 #endif
+#if defined(BENCHMARK_OS_MACOSX)
+#include <CoreFoundation/CoreFoundation.h>
+#include <IOKit/IOKitLib.h>
+#endif
 
 #include <algorithm>
 #include <array>
@@ -614,7 +618,7 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
   // below.
   if (bogo_clock >= 0.0) return bogo_clock;
 
-#elif defined BENCHMARK_HAS_SYSCTL
+#elif defined(BENCHMARK_HAS_SYSCTL) && !defined(BENCHMARK_OS_MACOSX)
   constexpr auto* FreqStr =
 #if defined(BENCHMARK_OS_FREEBSD) || defined(BENCHMARK_OS_NETBSD)
       "machdep.tsc_freq";
@@ -677,6 +681,19 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
 #elif defined(BENCHMARK_OS_QNX)
   return static_cast<double>((int64_t)(SYSPAGE_ENTRY(cpuinfo)->speed) *
                              (int64_t)(1000 * 1000));
+#elif defined(BENCHMARK_OS_MACOSX)
+  io_registry_entry_t cpu_freq_entry = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/cpus/cpu0@0");
+  if (cpu_freq_entry) {
+    CFDataRef cpu_freq = (CFDataRef)IORegistryEntryCreateCFProperty(cpu_freq_entry, CFSTR("clock-frequency"), kCFAllocatorDefault, 0);
+    uint32_t cpu_freq_u32 = 0;
+    if (cpu_freq) {
+      CFDataGetBytes(cpu_freq, CFRangeMake(0, sizeof(cpu_freq_u32)), (UInt8 *)&cpu_freq_u32);
+      CFRelease(cpu_freq);
+      IOObjectRelease(cpu_freq_entry);
+      return cpu_freq_u32;
+    }
+    IOObjectRelease(cpu_freq_entry);
+  }
 #endif
   // If we've fallen through, attempt to roughly estimate the CPU clock rate.
   const int estimate_time_ms = 1000;
