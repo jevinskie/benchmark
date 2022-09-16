@@ -25,12 +25,13 @@ set_target_properties(benchmark PROPERTIES
   SOVERSION ${GENERIC_LIB_SOVERSION}
 )
 target_include_directories(benchmark PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
+  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+)
 
 # libpfm, if available
 if (HAVE_LIBPFM)
   target_link_libraries(benchmark PRIVATE pfm)
-  add_definitions(-DHAVE_LIBPFM)
+  target_compile_definitions(benchmark PRIVATE -DHAVE_LIBPFM)
 endif()
 
 # Link threads.
@@ -57,6 +58,10 @@ if(${CMAKE_SYSTEM_NAME} MATCHES "SunOS")
   target_link_libraries(benchmark PRIVATE kstat)
 endif()
 
+if (NOT BUILD_SHARED_LIBS)
+  target_compile_definitions(benchmark PUBLIC -DBENCHMARK_STATIC_DEFINE)
+endif()
+
 # Benchmark main library
 add_library(benchmark_main "benchmark_main.cc")
 add_library(benchmark::benchmark_main ALIAS benchmark_main)
@@ -64,15 +69,16 @@ set_target_properties(benchmark_main PROPERTIES
   OUTPUT_NAME "benchmark_main"
   VERSION ${GENERIC_LIB_VERSION}
   SOVERSION ${GENERIC_LIB_SOVERSION}
+  DEFINE_SYMBOL benchmark_EXPORTS
 )
 target_link_libraries(benchmark_main PUBLIC benchmark::benchmark)
-
 
 set(generated_dir "${PROJECT_BINARY_DIR}")
 
 set(version_config "${generated_dir}/${PROJECT_NAME}ConfigVersion.cmake")
 set(project_config "${generated_dir}/${PROJECT_NAME}Config.cmake")
 set(pkg_config "${generated_dir}/${PROJECT_NAME}.pc")
+set(targets_to_export benchmark benchmark_main)
 set(targets_export_name "${PROJECT_NAME}Targets")
 
 set(namespace "${PROJECT_NAME}::")
@@ -92,10 +98,16 @@ write_basic_package_version_file(
 
 configure_file("${PROJECT_SOURCE_DIR}/cmake/benchmark.pc.in" "${pkg_config}" @ONLY)
 
+export (
+  TARGETS ${targets_to_export}
+  NAMESPACE "${namespace}"
+  FILE ${generated_dir}/${targets_export_name}.cmake
+)
+
 if (BENCHMARK_ENABLE_INSTALL)
   # Install target (will install the library to specified CMAKE_INSTALL_PREFIX variable)
   install(
-    TARGETS benchmark benchmark_main
+    TARGETS ${targets_to_export}
     EXPORT ${targets_export_name}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
@@ -104,6 +116,7 @@ if (BENCHMARK_ENABLE_INSTALL)
 
   install(
     DIRECTORY "${PROJECT_SOURCE_DIR}/include/benchmark"
+              "${PROJECT_BINARY_DIR}/include/benchmark"
     DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
     FILES_MATCHING PATTERN "*.*h")
 
@@ -142,18 +155,15 @@ if (BENCHMARK_ENABLE_DOXYGEN)
     ALL
     WORKING_DIRECTORY ${PROJECT_SOURCE_DIR}
     COMMENT "Building documentation with Doxygen.")
-  if (BENCHMARK_INSTALL_DOCS)
+  if (BENCHMARK_ENABLE_INSTALL AND BENCHMARK_INSTALL_DOCS)
     install(
       DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/html/"
       DESTINATION ${CMAKE_INSTALL_DOCDIR})
   endif()
 else()
-  if (BENCHMARK_INSTALL_DOCS)
+  if (BENCHMARK_ENABLE_INSTALL AND BENCHMARK_INSTALL_DOCS)
     install(
       DIRECTORY "${PROJECT_SOURCE_DIR}/docs/"
       DESTINATION ${CMAKE_INSTALL_DOCDIR})
   endif()
-
-  export (EXPORT ${targets_export_name} NAMESPACE "${namespace}"
-    FILE ${generated_dir}/${targets_export_name}.cmake)
 endif()

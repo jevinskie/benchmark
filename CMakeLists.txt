@@ -1,4 +1,4 @@
-cmake_minimum_required (VERSION 3.5.1)
+cmake_minimum_required (VERSION 3.16.3)
 
 foreach(p
     CMP0048 # OK to clear PROJECT_VERSION on project()
@@ -6,6 +6,7 @@ foreach(p
     CMP0056 # export EXE_LINKER_FLAGS to try_run
     CMP0057 # Support no if() IN_LIST operator
     CMP0063 # Honor visibility properties for all targets
+    CMP0067 # Honor language standard in try_compile() source file signature
     CMP0077 # Allow option() overrides in importing projects
     )
   if(POLICY ${p})
@@ -13,7 +14,7 @@ foreach(p
   endif()
 endforeach()
 
-project (benchmark VERSION 1.6.0 LANGUAGES CXX)
+project (benchmark VERSION 1.7.0 LANGUAGES CXX)
 
 option(BENCHMARK_ENABLE_TESTING "Enable testing of the benchmark library." ON)
 option(BENCHMARK_ENABLE_EXCEPTIONS "Enable the use of exceptions in the benchmark library." ON)
@@ -50,7 +51,10 @@ option(BENCHMARK_USE_BUNDLED_GTEST "Use bundled GoogleTest. If disabled, the fin
 
 option(BENCHMARK_ENABLE_LIBPFM "Enable performance counters provided by libpfm" OFF)
 
-set(CMAKE_WINDOWS_EXPORT_ALL_SYMBOLS ON)
+# Export only public symbols
+set(CMAKE_CXX_VISIBILITY_PRESET hidden)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN ON)
+
 if(MSVC)
     # As of CMake 3.18, CMAKE_SYSTEM_PROCESSOR is not set properly for MSVC and
     # cross-compilation (e.g. Host=x86_64, target=aarch64) requires using the
@@ -123,16 +127,26 @@ set(GENERIC_LIB_VERSION ${VERSION})
 string(SUBSTRING ${VERSION} 0 1 GENERIC_LIB_SOVERSION)
 
 # Import our CMake modules
-include(CheckCXXCompilerFlag)
 include(AddCXXCompilerFlag)
-include(CXXFeatureCheck)
+include(CheckCXXCompilerFlag)
 include(CheckLibraryExists)
+include(CXXFeatureCheck)
 
 check_library_exists(rt shm_open "" HAVE_LIB_RT)
 
 if (BENCHMARK_BUILD_32_BITS)
   add_required_cxx_compiler_flag(-m32)
 endif()
+
+if (MSVC)
+  set(BENCHMARK_CXX_STANDARD 14)
+else()
+  set(BENCHMARK_CXX_STANDARD 11)
+endif()
+
+set(CMAKE_CXX_STANDARD ${BENCHMARK_CXX_STANDARD})
+set(CMAKE_CXX_STANDARD_REQUIRED YES)
+set(CMAKE_CXX_EXTENSIONS OFF)
 
 if (MSVC)
   # Turn compiler warnings up to 11
@@ -166,17 +180,11 @@ if (MSVC)
     set(CMAKE_EXE_LINKER_FLAGS_MINSIZEREL "${CMAKE_EXE_LINKER_FLAGS_MINSIZEREL} /LTCG")
   endif()
 else()
-  # Try and enable C++11. Don't use C++14 because it doesn't work in some
-  # configurations.
-  add_cxx_compiler_flag(-std=c++11)
-  if (NOT HAVE_CXX_FLAG_STD_CXX11)
-    add_cxx_compiler_flag(-std=c++0x)
-  endif()
-
   # Turn compiler warnings up to 11
   add_cxx_compiler_flag(-Wall)
   add_cxx_compiler_flag(-Wextra)
   add_cxx_compiler_flag(-Wshadow)
+  add_cxx_compiler_flag(-Wfloat-equal)
   if(BENCHMARK_ENABLE_WERROR)
       add_cxx_compiler_flag(-Werror RELEASE)
       add_cxx_compiler_flag(-Werror RELWITHDEBINFO)
@@ -219,7 +227,7 @@ else()
   add_cxx_compiler_flag(-wd654)
   add_cxx_compiler_flag(-Wthread-safety)
   if (HAVE_CXX_FLAG_WTHREAD_SAFETY)
-    cxx_feature_check(THREAD_SAFETY_ATTRIBUTES)
+    cxx_feature_check(THREAD_SAFETY_ATTRIBUTES "-DINCLUDE_DIRECTORIES=${PROJECT_SOURCE_DIR}/include")
   endif()
 
   # On most UNIX like platforms g++ and clang++ define _GNU_SOURCE as a

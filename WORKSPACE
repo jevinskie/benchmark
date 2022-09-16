@@ -1,6 +1,7 @@
 workspace(name = "com_github_google_benchmark")
 
 load("@bazel_tools//tools/build_defs/repo:http.bzl", "http_archive")
+load("@bazel_tools//tools/build_defs/repo:git.bzl", "git_repository")
 
 http_archive(
     name = "com_google_absl",
@@ -9,19 +10,18 @@ http_archive(
     urls = ["https://github.com/abseil/abseil-cpp/archive/20200225.2.tar.gz"],
 )
 
-http_archive(
+git_repository(
     name = "com_google_googletest",
-    strip_prefix = "googletest-3f0cf6b62ad1eb50d8736538363d3580dd640c3e",
-    urls = ["https://github.com/google/googletest/archive/3f0cf6b62ad1eb50d8736538363d3580dd640c3e.zip"],
-    sha256 = "8f827dd550db8b4fdf73904690df0be9fccc161017c9038a724bc9a0617a1bc8",
+    remote = "https://github.com/google/googletest.git",
+    tag = "release-1.11.0",
 )
 
 http_archive(
     name = "pybind11",
     build_file = "@//bindings/python:pybind11.BUILD",
-    sha256 = "1eed57bc6863190e35637290f97a20c81cfe4d9090ac0a24f3bbf08f265eb71d",
-    strip_prefix = "pybind11-2.4.3",
-    urls = ["https://github.com/pybind/pybind11/archive/v2.4.3.tar.gz"],
+    sha256 = "eacf582fa8f696227988d08cfc46121770823839fe9e301a20fbce67e7cd70ec",
+    strip_prefix = "pybind11-2.10.0",
+    urls = ["https://github.com/pybind/pybind11/archive/v2.10.0.tar.gz"],
 )
 
 new_local_repository(
