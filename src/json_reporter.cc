@@ -167,12 +167,19 @@ bool JSONReporter::ReportContext(const Context& context) {
   }
   out << "],\n";
 
+  out << indent << FormatKV("library_version", GetBenchmarkVersion());
+  out << ",\n";
+
 #if defined(NDEBUG)
   const char build_type[] = "release";
 #else
   const char build_type[] = "debug";
 #endif
   out << indent << FormatKV("library_build_type", build_type);
+  out << ",\n";
+
+  // NOTE: our json schema is not strictly tied to the library version!
+  out << indent << FormatKV("json_schema_version", int64_t(1));
 
   std::map<std::string, std::string>* global_context =
       internal::GetGlobalContext();
@@ -254,9 +261,12 @@ void JSONReporter::PrintRunData(Run const& run) {
       BENCHMARK_UNREACHABLE();
     }()) << ",\n";
   }
-  if (run.error_occurred) {
-    out << indent << FormatKV("error_occurred", run.error_occurred) << ",\n";
-    out << indent << FormatKV("error_message", run.error_message) << ",\n";
+  if (internal::SkippedWithError == run.skipped) {
+    out << indent << FormatKV("error_occurred", true) << ",\n";
+    out << indent << FormatKV("error_message", run.skip_message) << ",\n";
+  } else if (internal::SkippedWithMessage == run.skipped) {
+    out << indent << FormatKV("skipped", true) << ",\n";
+    out << indent << FormatKV("skip_message", run.skip_message) << ",\n";
   }
   if (!run.report_big_o && !run.report_rms) {
     out << indent << FormatKV("iterations", run.iterations) << ",\n";
@@ -294,7 +304,8 @@ void JSONReporter::PrintRunData(Run const& run) {
     out << ",\n"
         << indent << FormatKV("max_bytes_used", memory_result.max_bytes_used);
 
-    auto report_if_present = [&out, &indent](const char* label, int64_t val) {
+    auto report_if_present = [&out, &indent](const std::string& label,
+                                             int64_t val) {
       if (val != MemoryManager::TombstoneValue)
         out << ",\n" << indent << FormatKV(label, val);
     };

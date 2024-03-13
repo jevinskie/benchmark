@@ -1,60 +1,31 @@
 import os
-import posixpath
 import platform
-import re
 import shutil
-import sys
+from pathlib import Path
+from typing import Any
 
-from distutils import sysconfig
 import setuptools
 from setuptools.command import build_ext
 
+IS_WINDOWS = platform.system() == "Windows"
+IS_MAC = platform.system() == "Darwin"
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-
-IS_WINDOWS = sys.platform.startswith("win")
-
-
-with open("README.md", "r", encoding="utf-8") as fp:
-    long_description = fp.read()
-
-
-def _get_version():
-    """Parse the version string from __init__.py."""
-    with open(
-        os.path.join(HERE, "bindings", "python", "google_benchmark", "__init__.py")
-    ) as init_file:
-        try:
-            version_line = next(
-                line for line in init_file if line.startswith("__version__")
-            )
-        except StopIteration:
-            raise ValueError("__version__ not defined in __init__.py")
-        else:
-            namespace = {}
-            exec(version_line, namespace)  # pylint: disable=exec-used
-            return namespace["__version__"]
-
-
-def _parse_requirements(path):
-    with open(os.path.join(HERE, path)) as requirements:
-        return [
-            line.rstrip()
-            for line in requirements
-            if not (line.isspace() or line.startswith("#"))
-        ]
+# hardcoded SABI-related options. Requires that each Python interpreter
+# (hermetic or not) participating is of the same major-minor version.
+version_tuple = tuple(int(i) for i in platform.python_version_tuple())
+py_limited_api = version_tuple >= (3, 12)
+options = {"bdist_wheel": {"py_limited_api": "cp312"}} if py_limited_api else {}
 
 
 class BazelExtension(setuptools.Extension):
     """A C/C++ extension that is defined as a Bazel BUILD target."""
 
-    def __init__(self, name, bazel_target):
+    def __init__(self, name: str, bazel_target: str, **kwargs: Any):
+        super().__init__(name=name, sources=[], **kwargs)
+
         self.bazel_target = bazel_target
-        self.relpath, self.target_name = posixpath.relpath(bazel_target, "//").split(
-            ":"
-        )
-        setuptools.Extension.__init__(self, name, sources=[])
+        stripped_target = bazel_target.split("//")[-1]
+        self.relpath, self.target_name = stripped_target.split(":")
 
 
 class BuildBazelExtension(build_ext.build_ext):
@@ -63,96 +34,82 @@ class BuildBazelExtension(build_ext.build_ext):
     def run(self):
         for ext in self.extensions:
             self.bazel_build(ext)
-        build_ext.build_ext.run(self)
+        super().run()
+        # explicitly call `bazel shutdown` for graceful exit
+        self.spawn(["bazel", "shutdown"])
 
-    def bazel_build(self, ext):
+    def copy_extensions_to_source(self):
+        """
+        Copy generated extensions into the source tree.
+        This is done in the ``bazel_build`` method, so it's not necessary to
+        do again in the `build_ext` base class.
+        """
+        pass
+
+    def bazel_build(self, ext: BazelExtension) -> None:
         """Runs the bazel build to create the package."""
-        with open("WORKSPACE", "r") as workspace:
-            workspace_contents = workspace.read()
-
-        with open("WORKSPACE", "w") as workspace:
-            workspace.write(
-                re.sub(
-                    r'(?<=path = ").*(?=",  # May be overwritten by setup\.py\.)',
-                    sysconfig.get_python_inc().replace(os.path.sep, posixpath.sep),
-                    workspace_contents,
-                )
-            )
-
-        if not os.path.exists(self.build_temp):
-            os.makedirs(self.build_temp)
+        temp_path = Path(self.build_temp)
+        # omit the patch version to avoid build errors if the toolchain is not
+        # yet registered in the current @rules_python version.
+        # patch version differences should be fine.
+        python_version = ".".join(platform.python_version_tuple()[:2])
 
         bazel_argv = [
             "bazel",
             "build",
             ext.bazel_target,
-            "--symlink_prefix=" + os.path.join(self.build_temp, "bazel-"),
-            "--compilation_mode=" + ("dbg" if self.debug else "opt"),
+            f"--symlink_prefix={temp_path / 'bazel-'}",
+            f"--compilation_mode={'dbg' if self.debug else 'opt'}",
+            # C++17 is required by nanobind
+            f"--cxxopt={'/std:c++17' if IS_WINDOWS else '-std=c++17'}",
+            f"--@rules_python//python/config_settings:python_version={python_version}",
         ]
+
+        if ext.py_limited_api:
+            bazel_argv += ["--@nanobind_bazel//:py-limited-api=cp312"]
 
         if IS_WINDOWS:
             # Link with python*.lib.
             for library_dir in self.library_dirs:
                 bazel_argv.append("--linkopt=/LIBPATH:" + library_dir)
-        elif sys.platform == "darwin" and platform.machine() == "x86_64":
-            bazel_argv.append("--macos_minimum_os=10.9")
+        elif IS_MAC:
+            if platform.machine() == "x86_64":
+                # C++17 needs macOS 10.14 at minimum
+                bazel_argv.append("--macos_minimum_os=10.14")
 
-            # ARCHFLAGS is always set by cibuildwheel before macOS wheel builds.
-            archflags = os.getenv("ARCHFLAGS", "")
-            if "arm64" in archflags:
-                bazel_argv.append("--cpu=darwin_arm64")
-                bazel_argv.append("--macos_cpus=arm64")
+                # cross-compilation for Mac ARM64 on GitHub Mac x86 runners.
+                # ARCHFLAGS is set by cibuildwheel before macOS wheel builds.
+                archflags = os.getenv("ARCHFLAGS", "")
+                if "arm64" in archflags:
+                    bazel_argv.append("--cpu=darwin_arm64")
+                    bazel_argv.append("--macos_cpus=arm64")
+
+            elif platform.machine() == "arm64":
+                bazel_argv.append("--macos_minimum_os=11.0")
 
         self.spawn(bazel_argv)
 
-        shared_lib_suffix = '.dll' if IS_WINDOWS else '.so'
-        ext_bazel_bin_path = os.path.join(
-            self.build_temp, 'bazel-bin',
-            ext.relpath, ext.target_name + shared_lib_suffix)
+        if IS_WINDOWS:
+            suffix = ".pyd"
+        else:
+            suffix = ".abi3.so" if ext.py_limited_api else ".so"
 
-        ext_dest_path = self.get_ext_fullpath(ext.name)
-        ext_dest_dir = os.path.dirname(ext_dest_path)
-        if not os.path.exists(ext_dest_dir):
-            os.makedirs(ext_dest_dir)
+        ext_name = ext.target_name + suffix
+        ext_bazel_bin_path = temp_path / "bazel-bin" / ext.relpath / ext_name
+        ext_dest_path = Path(self.get_ext_fullpath(ext.name)).with_name(
+            ext_name
+        )
         shutil.copyfile(ext_bazel_bin_path, ext_dest_path)
-
-        # explicitly call `bazel shutdown` for graceful exit
-        self.spawn(["bazel", "shutdown"])
 
 
 setuptools.setup(
-    name="google_benchmark",
-    version=_get_version(),
-    url="https://github.com/google/benchmark",
-    description="A library to benchmark code snippets.",
-    long_description=long_description,
-    long_description_content_type="text/markdown",
-    author="Google",
-    author_email="benchmark-py@google.com",
-    # Contained modules and scripts.
-    package_dir={"": "bindings/python"},
-    packages=setuptools.find_packages("bindings/python"),
-    install_requires=_parse_requirements("bindings/python/requirements.txt"),
     cmdclass=dict(build_ext=BuildBazelExtension),
     ext_modules=[
         BazelExtension(
-            "google_benchmark._benchmark",
-            "//bindings/python/google_benchmark:_benchmark",
+            name="google_benchmark._benchmark",
+            bazel_target="//bindings/python/google_benchmark:_benchmark",
+            py_limited_api=py_limited_api,
         )
     ],
-    zip_safe=False,
-    # PyPI package information.
-    classifiers=[
-        "Development Status :: 4 - Beta",
-        "Intended Audience :: Developers",
-        "Intended Audience :: Science/Research",
-        "License :: OSI Approved :: Apache Software License",
-        "Programming Language :: Python :: 3.6",
-        "Programming Language :: Python :: 3.7",
-        "Programming Language :: Python :: 3.8",
-        "Topic :: Software Development :: Testing",
-        "Topic :: System :: Benchmark",
-    ],
-    license="Apache 2.0",
-    keywords="benchmark",
+    options=options,
 )

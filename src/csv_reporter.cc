@@ -109,10 +109,10 @@ BENCHMARK_EXPORT
 void CSVReporter::PrintRunData(const Run& run) {
   std::ostream& Out = GetOutputStream();
   Out << CsvEscape(run.benchmark_name()) << ",";
-  if (run.error_occurred) {
+  if (run.skipped) {
     Out << std::string(elements.size() - 3, ',');
-    Out << "true,";
-    Out << CsvEscape(run.error_message) << "\n";
+    Out << std::boolalpha << (internal::SkippedWithError == run.skipped) << ",";
+    Out << CsvEscape(run.skip_message) << "\n";
     return;
   }
 
@@ -122,13 +122,21 @@ void CSVReporter::PrintRunData(const Run& run) {
   }
   Out << ",";
 
-  Out << run.GetAdjustedRealTime() << ",";
-  Out << run.GetAdjustedCPUTime() << ",";
+  if (run.run_type != Run::RT_Aggregate ||
+      run.aggregate_unit == StatisticUnit::kTime) {
+    Out << run.GetAdjustedRealTime() << ",";
+    Out << run.GetAdjustedCPUTime() << ",";
+  } else {
+    assert(run.aggregate_unit == StatisticUnit::kPercentage);
+    Out << run.real_accumulated_time << ",";
+    Out << run.cpu_accumulated_time << ",";
+  }
 
   // Do not print timeLabel on bigO and RMS report
   if (run.report_big_o) {
     Out << GetBigOString(run.complexity);
-  } else if (!run.report_rms) {
+  } else if (!run.report_rms &&
+             run.aggregate_unit != StatisticUnit::kPercentage) {
     Out << GetTimeUnitString(run.time_unit);
   }
   Out << ",";

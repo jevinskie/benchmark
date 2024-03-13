@@ -15,6 +15,10 @@
 #include "internal_macros.h"
 
 #ifdef BENCHMARK_OS_WINDOWS
+#if !defined(WINVER) || WINVER < 0x0600
+#undef WINVER
+#define WINVER 0x0600
+#endif  // WINVER handling
 #include <shlwapi.h>
 #undef StrCat  // Don't let StrCat in string_util.h be renamed to lstrcatA
 #include <versionhelpers.h>
@@ -23,7 +27,7 @@
 #include <codecvt>
 #else
 #include <fcntl.h>
-#ifndef BENCHMARK_OS_FUCHSIA
+#if !defined(BENCHMARK_OS_FUCHSIA) && !defined(BENCHMARK_OS_QURT)
 #include <sys/resource.h>
 #endif
 #include <sys/time.h>
@@ -38,9 +42,16 @@
 #endif
 #if defined(BENCHMARK_OS_SOLARIS)
 #include <kstat.h>
+#include <netdb.h>
 #endif
 #if defined(BENCHMARK_OS_QNX)
 #include <sys/syspage.h>
+#endif
+#if defined(BENCHMARK_OS_QURT)
+#include <qurt.h>
+#endif
+#if defined(BENCHMARK_HAS_PTHREAD_AFFINITY)
+#include <pthread.h>
 #endif
 #if defined(BENCHMARK_OS_MACOSX)
 #include <CoreFoundation/CoreFoundation.h>
@@ -62,15 +73,17 @@
 #include <limits>
 #include <locale>
 #include <memory>
+#include <random>
 #include <sstream>
 #include <utility>
 
+#include "benchmark/benchmark.h"
 #include "check.h"
 #include "cycleclock.h"
 #include "internal_macros.h"
 #include "log.h"
-#include "sleep.h"
 #include "string_util.h"
+#include "timers.h"
 
 namespace benchmark {
 namespace {
@@ -323,7 +336,7 @@ std::vector<CPUInfo::CacheInfo> GetCacheSizesWindows() {
 
   using UPtr = std::unique_ptr<PInfo, decltype(&std::free)>;
   GetLogicalProcessorInformation(nullptr, &buffer_size);
-  UPtr buff((PInfo*)malloc(buffer_size), &std::free);
+  UPtr buff(static_cast<PInfo*>(std::malloc(buffer_size)), &std::free);
   if (!GetLogicalProcessorInformation(buff.get(), &buffer_size))
     PrintErrorAndDie("Failed during call to GetLogicalProcessorInformation: ",
                      GetLastError());
@@ -341,7 +354,7 @@ std::vector<CPUInfo::CacheInfo> GetCacheSizesWindows() {
     CPUInfo::CacheInfo C;
     C.num_sharing = static_cast<int>(b.count());
     C.level = cache.Level;
-    C.size = cache.Size;
+    C.size = static_cast<int>(cache.Size);
     C.type = "Unknown";
     switch (cache.Type) {
       case CacheUnified:
@@ -406,6 +419,8 @@ std::vector<CPUInfo::CacheInfo> GetCacheSizes() {
   return GetCacheSizesWindows();
 #elif defined(BENCHMARK_OS_QNX)
   return GetCacheSizesQNX();
+#elif defined(BENCHMARK_OS_QURT)
+  return std::vector<CPUInfo::CacheInfo>();
 #else
   return GetCacheSizesFromKVFS();
 #endif
@@ -421,24 +436,25 @@ std::string GetSystemName() {
 #ifndef UNICODE
   str = std::string(hostname, DWCOUNT);
 #else
-  std::vector<wchar_t> converted;
-  // Find the length first.
-  int len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, hostname,
-                                  DWCOUNT, converted.begin(), 0);
-  // TODO: Report error from GetLastError()?
-  if (len == 0) return std::string("");
-  converted.reserve(len + 1);
-
-  len = ::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, hostname, DWCOUNT,
-                              converted.begin(), converted.size());
-  // TODO: Report error from GetLastError()?
-  if (len == 0) return std::string("");
-  str = std::string(converted.data());
+  // `WideCharToMultiByte` returns `0` when conversion fails.
+  int len = WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, hostname,
+                                DWCOUNT, NULL, 0, NULL, NULL);
+  str.resize(len);
+  WideCharToMultiByte(CP_UTF8, WC_ERR_INVALID_CHARS, hostname, DWCOUNT, &str[0],
+                      str.size(), NULL, NULL);
 #endif
   return str;
-#else  // defined(BENCHMARK_OS_WINDOWS)
+#elif defined(BENCHMARK_OS_QURT)
+  std::string str = "Hexagon DSP";
+  qurt_arch_version_t arch_version_struct;
+  if (qurt_sysenv_get_arch_version(&arch_version_struct) == QURT_EOK) {
+    str += " v";
+    str += std::to_string(arch_version_struct.arch_version);
+  }
+  return str;
+#else
 #ifndef HOST_NAME_MAX
-#ifdef BENCHMARK_HAS_SYSCTL  // BSD/Mac Doesnt have HOST_NAME_MAX defined
+#ifdef BENCHMARK_HAS_SYSCTL  // BSD/Mac doesn't have HOST_NAME_MAX defined
 #define HOST_NAME_MAX 64
 #elif defined(BENCHMARK_OS_NACL)
 #define HOST_NAME_MAX 64
@@ -446,6 +462,10 @@ std::string GetSystemName() {
 #define HOST_NAME_MAX 154
 #elif defined(BENCHMARK_OS_RTEMS)
 #define HOST_NAME_MAX 256
+#elif defined(BENCHMARK_OS_SOLARIS)
+#define HOST_NAME_MAX MAXHOSTNAMELEN
+#elif defined(BENCHMARK_OS_ZOS)
+#define HOST_NAME_MAX _POSIX_HOST_NAME_MAX
 #else
 #pragma message("HOST_NAME_MAX not defined. using 64")
 #define HOST_NAME_MAX 64
@@ -458,40 +478,47 @@ std::string GetSystemName() {
 #endif  // Catch-all POSIX block.
 }
 
-int GetNumCPUs() {
+int GetNumCPUsImpl() {
 #ifdef BENCHMARK_HAS_SYSCTL
   int num_cpu = -1;
   if (GetSysctl("hw.ncpu", &num_cpu)) return num_cpu;
-  fprintf(stderr, "Err: %s\n", strerror(errno));
-  std::exit(EXIT_FAILURE);
+  PrintErrorAndDie("Err: ", strerror(errno));
 #elif defined(BENCHMARK_OS_WINDOWS)
   SYSTEM_INFO sysinfo;
   // Use memset as opposed to = {} to avoid GCC missing initializer false
   // positives.
   std::memset(&sysinfo, 0, sizeof(SYSTEM_INFO));
   GetSystemInfo(&sysinfo);
-  return sysinfo.dwNumberOfProcessors;  // number of logical
-                                        // processors in the current
-                                        // group
+  // number of logical processors in the current group
+  return static_cast<int>(sysinfo.dwNumberOfProcessors);
 #elif defined(BENCHMARK_OS_SOLARIS)
   // Returns -1 in case of a failure.
-  int num_cpu = sysconf(_SC_NPROCESSORS_ONLN);
+  long num_cpu = sysconf(_SC_NPROCESSORS_ONLN);
   if (num_cpu < 0) {
-    fprintf(stderr, "sysconf(_SC_NPROCESSORS_ONLN) failed with error: %s\n",
-            strerror(errno));
+    PrintErrorAndDie("sysconf(_SC_NPROCESSORS_ONLN) failed with error: ",
+                     strerror(errno));
   }
-  return num_cpu;
+  return (int)num_cpu;
 #elif defined(BENCHMARK_OS_QNX)
   return static_cast<int>(_syspage_ptr->num_cpu);
+#elif defined(BENCHMARK_OS_QURT)
+  qurt_sysenv_max_hthreads_t hardware_threads;
+  if (qurt_sysenv_get_max_hw_threads(&hardware_threads) != QURT_EOK) {
+    hardware_threads.max_hthreads = 1;
+  }
+  return hardware_threads.max_hthreads;
 #else
   int num_cpus = 0;
   int max_id = -1;
   std::ifstream f("/proc/cpuinfo");
   if (!f.is_open()) {
-    std::cerr << "failed to open /proc/cpuinfo\n";
-    return -1;
+    PrintErrorAndDie("Failed to open /proc/cpuinfo");
   }
+#if defined(__alpha__)
+  const std::string Key = "cpus detected";
+#else
   const std::string Key = "processor";
+#endif
   std::string ln;
   while (std::getline(f, ln)) {
     if (ln.empty()) continue;
@@ -514,12 +541,10 @@ int GetNumCPUs() {
     }
   }
   if (f.bad()) {
-    std::cerr << "Failure reading /proc/cpuinfo\n";
-    return -1;
+    PrintErrorAndDie("Failure reading /proc/cpuinfo");
   }
   if (!f.eof()) {
-    std::cerr << "Failed to read to end of /proc/cpuinfo\n";
-    return -1;
+    PrintErrorAndDie("Failed to read to end of /proc/cpuinfo");
   }
   f.close();
 
@@ -532,6 +557,90 @@ int GetNumCPUs() {
 #endif
   BENCHMARK_UNREACHABLE();
 }
+
+int GetNumCPUs() {
+  const int num_cpus = GetNumCPUsImpl();
+  if (num_cpus < 1) {
+    PrintErrorAndDie(
+        "Unable to extract number of CPUs.  If your platform uses "
+        "/proc/cpuinfo, custom support may need to be added.");
+  }
+  return num_cpus;
+}
+
+class ThreadAffinityGuard final {
+ public:
+  ThreadAffinityGuard() : reset_affinity(SetAffinity()) {
+    if (!reset_affinity)
+      std::cerr << "***WARNING*** Failed to set thread affinity. Estimated CPU "
+                   "frequency may be incorrect."
+                << std::endl;
+  }
+
+  ~ThreadAffinityGuard() {
+    if (!reset_affinity) return;
+
+#if defined(BENCHMARK_HAS_PTHREAD_AFFINITY)
+    int ret = pthread_setaffinity_np(self, sizeof(previous_affinity),
+                                     &previous_affinity);
+    if (ret == 0) return;
+#elif defined(BENCHMARK_OS_WINDOWS_WIN32)
+    DWORD_PTR ret = SetThreadAffinityMask(self, previous_affinity);
+    if (ret != 0) return;
+#endif  // def BENCHMARK_HAS_PTHREAD_AFFINITY
+    PrintErrorAndDie("Failed to reset thread affinity");
+  }
+
+  ThreadAffinityGuard(ThreadAffinityGuard&&) = delete;
+  ThreadAffinityGuard(const ThreadAffinityGuard&) = delete;
+  ThreadAffinityGuard& operator=(ThreadAffinityGuard&&) = delete;
+  ThreadAffinityGuard& operator=(const ThreadAffinityGuard&) = delete;
+
+ private:
+  bool SetAffinity() {
+#if defined(BENCHMARK_HAS_PTHREAD_AFFINITY)
+    int ret;
+    self = pthread_self();
+    ret = pthread_getaffinity_np(self, sizeof(previous_affinity),
+                                 &previous_affinity);
+    if (ret != 0) return false;
+
+    cpu_set_t affinity;
+    memcpy(&affinity, &previous_affinity, sizeof(affinity));
+
+    bool is_first_cpu = true;
+
+    for (int i = 0; i < CPU_SETSIZE; ++i)
+      if (CPU_ISSET(i, &affinity)) {
+        if (is_first_cpu)
+          is_first_cpu = false;
+        else
+          CPU_CLR(i, &affinity);
+      }
+
+    if (is_first_cpu) return false;
+
+    ret = pthread_setaffinity_np(self, sizeof(affinity), &affinity);
+    return ret == 0;
+#elif defined(BENCHMARK_OS_WINDOWS_WIN32)
+    self = GetCurrentThread();
+    DWORD_PTR mask = static_cast<DWORD_PTR>(1) << GetCurrentProcessorNumber();
+    previous_affinity = SetThreadAffinityMask(self, mask);
+    return previous_affinity != 0;
+#else
+    return false;
+#endif  // def BENCHMARK_HAS_PTHREAD_AFFINITY
+  }
+
+#if defined(BENCHMARK_HAS_PTHREAD_AFFINITY)
+  pthread_t self;
+  cpu_set_t previous_affinity;
+#elif defined(BENCHMARK_OS_WINDOWS_WIN32)
+  HANDLE self;
+  DWORD_PTR previous_affinity;
+#endif  // def BENCHMARK_HAS_PTHREAD_AFFINITY
+  bool reset_affinity;
+};
 
 double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
   // Currently, scaling is only used on linux path here,
@@ -561,7 +670,7 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
                       &freq)) {
     // The value is in kHz (as the file name suggests).  For example, on a
     // 2GHz warpstation, the file contains the value "2000000".
-    return freq * 1000.0;
+    return static_cast<double>(freq) * 1000.0;
   }
 
   const double error_value = -1;
@@ -648,15 +757,16 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
           SHGetValueA(HKEY_LOCAL_MACHINE,
                       "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0",
                       "~MHz", nullptr, &data, &data_size)))
-    return static_cast<double>((int64_t)data *
-                               (int64_t)(1000 * 1000));  // was mhz
+    return static_cast<double>(static_cast<int64_t>(data) *
+                               static_cast<int64_t>(1000 * 1000));  // was mhz
 #elif defined(BENCHMARK_OS_SOLARIS)
   kstat_ctl_t* kc = kstat_open();
   if (!kc) {
     std::cerr << "failed to open /dev/kstat\n";
     return -1;
   }
-  kstat_t* ksp = kstat_lookup(kc, (char*)"cpu_info", -1, (char*)"cpu_info0");
+  kstat_t* ksp = kstat_lookup(kc, const_cast<char*>("cpu_info"), -1,
+                              const_cast<char*>("cpu_info0"));
   if (!ksp) {
     std::cerr << "failed to lookup in /dev/kstat\n";
     return -1;
@@ -665,8 +775,8 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
     std::cerr << "failed to read from /dev/kstat\n";
     return -1;
   }
-  kstat_named_t* knp =
-      (kstat_named_t*)kstat_data_lookup(ksp, (char*)"current_clock_Hz");
+  kstat_named_t* knp = (kstat_named_t*)kstat_data_lookup(
+      ksp, const_cast<char*>("current_clock_Hz"));
   if (!knp) {
     std::cerr << "failed to lookup data in /dev/kstat\n";
     return -1;
@@ -680,8 +790,12 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
   kstat_close(kc);
   return clock_hz;
 #elif defined(BENCHMARK_OS_QNX)
-  return static_cast<double>((int64_t)(SYSPAGE_ENTRY(cpuinfo)->speed) *
-                             (int64_t)(1000 * 1000));
+  return static_cast<double>(
+      static_cast<int64_t>(SYSPAGE_ENTRY(cpuinfo)->speed) *
+      static_cast<int64_t>(1000 * 1000));
+#elif defined(BENCHMARK_OS_QURT)
+  // QuRT doesn't provide any API to query Hexagon frequency.
+  return 1000000000;
 #elif defined(BENCHMARK_OS_MACOSX)
   io_registry_entry_t cpu_freq_entry = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/cpus/cpu0@0");
   if (cpu_freq_entry) {
@@ -697,20 +811,49 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
   }
 #endif
   // If we've fallen through, attempt to roughly estimate the CPU clock rate.
-  static constexpr int estimate_time_ms = 1000;
+
+  // Make sure to use the same cycle counter when starting and stopping the
+  // cycle timer. We just pin the current thread to a cpu in the previous
+  // affinity set.
+  ThreadAffinityGuard affinity_guard;
+
+  static constexpr double estimate_time_s = 1.0;
+  const double start_time = ChronoClockNow();
   const auto start_ticks = cycleclock::Now();
-  SleepForMilliseconds(estimate_time_ms);
-  return static_cast<double>(cycleclock::Now() - start_ticks);
+
+  // Impose load instead of calling sleep() to make sure the cycle counter
+  // works.
+  using PRNG = std::minstd_rand;
+  using Result = PRNG::result_type;
+  PRNG rng(static_cast<Result>(start_ticks));
+
+  Result state = 0;
+
+  do {
+    static constexpr size_t batch_size = 10000;
+    rng.discard(batch_size);
+    state += rng();
+
+  } while (ChronoClockNow() - start_time < estimate_time_s);
+
+  DoNotOptimize(state);
+
+  const auto end_ticks = cycleclock::Now();
+  const double end_time = ChronoClockNow();
+
+  return static_cast<double>(end_ticks - start_ticks) / (end_time - start_time);
+  // Reset the affinity of current thread when the lifetime of affinity_guard
+  // ends.
 }
 
 std::vector<double> GetLoadAvg() {
 #if (defined BENCHMARK_OS_FREEBSD || defined(BENCHMARK_OS_LINUX) ||     \
      defined BENCHMARK_OS_MACOSX || defined BENCHMARK_OS_NETBSD ||      \
      defined BENCHMARK_OS_OPENBSD || defined BENCHMARK_OS_DRAGONFLY) && \
-    !defined(__ANDROID__)
+    !(defined(__ANDROID__) && __ANDROID_API__ < 29)
   static constexpr int kMaxSamples = 3;
   std::vector<double> res(kMaxSamples, 0.0);
-  const int nelem = getloadavg(res.data(), kMaxSamples);
+  const size_t nelem = static_cast<size_t>(getloadavg(res.data(), kMaxSamples));
   if (nelem < 1) {
     res.clear();
   } else {

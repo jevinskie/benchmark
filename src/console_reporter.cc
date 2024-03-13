@@ -42,11 +42,15 @@ bool ConsoleReporter::ReportContext(const Context& context) {
   PrintBasicContext(&GetErrorStream(), context);
 
 #ifdef BENCHMARK_OS_WINDOWS
-  if ((output_options_ & OO_Color) && &std::cout != &GetOutputStream()) {
-    GetErrorStream()
-        << "Color printing is only supported for stdout on windows."
-           " Disabling color printing\n";
-    output_options_ = static_cast<OutputOptions>(output_options_ & ~OO_Color);
+  if ((output_options_ & OO_Color)) {
+    auto stdOutBuf = std::cout.rdbuf();
+    auto outStreamBuf = GetOutputStream().rdbuf();
+    if (stdOutBuf != outStreamBuf) {
+      GetErrorStream()
+          << "Color printing is only supported for stdout on windows."
+             " Disabling color printing\n";
+      output_options_ = static_cast<OutputOptions>(output_options_ & ~OO_Color);
+    }
   }
 #endif
 
@@ -115,7 +119,7 @@ static std::string FormatTime(double time) {
   if (time < 100.0) {
     return FormatString("%10.1f", time);
   }
-  // Assuming the time ist at max 9.9999e+99 and we have 10 digits for the
+  // Assuming the time is at max 9.9999e+99 and we have 10 digits for the
   // number, we get 10-1(.)-1(e)-1(sign)-2(exponent) = 5 digits to print.
   if (time > 9999999999 /*max 10 digit number*/) {
     return FormatString("%1.4e", time);
@@ -135,9 +139,13 @@ void ConsoleReporter::PrintRunData(const Run& result) {
   printer(Out, name_color, "%-*s ", name_field_width_,
           result.benchmark_name().c_str());
 
-  if (result.error_occurred) {
+  if (internal::SkippedWithError == result.skipped) {
     printer(Out, COLOR_RED, "ERROR OCCURRED: \'%s\'",
-            result.error_message.c_str());
+            result.skip_message.c_str());
+    printer(Out, COLOR_DEFAULT, "\n");
+    return;
+  } else if (internal::SkippedWithMessage == result.skipped) {
+    printer(Out, COLOR_WHITE, "SKIPPED: \'%s\'", result.skip_message.c_str());
     printer(Out, COLOR_DEFAULT, "\n");
     return;
   }
