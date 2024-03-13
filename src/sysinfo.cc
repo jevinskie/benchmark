@@ -799,10 +799,10 @@ double GetCPUCyclesPerSecond(CPUInfo::Scaling scaling) {
 #elif defined(BENCHMARK_OS_MACOSX)
   io_registry_entry_t cpu_freq_entry = IORegistryEntryFromPath(kIOMainPortDefault, "IODeviceTree:/cpus/cpu0@0");
   if (cpu_freq_entry) {
-    CFDataRef cpu_freq = (CFDataRef)IORegistryEntryCreateCFProperty(cpu_freq_entry, CFSTR("clock-frequency"), kCFAllocatorDefault, 0);
+    CFDataRef cpu_freq = static_cast<CFDataRef>(IORegistryEntryCreateCFProperty(cpu_freq_entry, CFSTR("clock-frequency"), kCFAllocatorDefault, 0));
     uint32_t cpu_freq_u32 = 0;
     if (cpu_freq) {
-      CFDataGetBytes(cpu_freq, CFRangeMake(0, sizeof(cpu_freq_u32)), (UInt8 *)&cpu_freq_u32);
+      CFDataGetBytes(cpu_freq, CFRangeMake(0, sizeof(cpu_freq_u32)), reinterpret_cast<UInt8 *>(&cpu_freq_u32));
       CFRelease(cpu_freq);
       IOObjectRelease(cpu_freq_entry);
       return cpu_freq_u32;
